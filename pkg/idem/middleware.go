@@ -3,12 +3,13 @@ package idem
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Default configurations
@@ -19,13 +20,46 @@ const (
 	DefaultTTL          = 24 * time.Hour
 )
 
-// Metrics holds Prometheus-compatible lock-free counters.
+// Metrics holds Prometheus-compatible counters.
 type Metrics struct {
-	AcquiredTotal        atomic.Uint64
-	ReplayedTotal        atomic.Uint64
-	ConflictTotal        atomic.Uint64
-	MismatchTotal        atomic.Uint64
-	ReleasedOnErrorTotal atomic.Uint64
+	AcquiredTotal        prometheus.Counter
+	ReplayedTotal        prometheus.Counter
+	ConflictTotal        prometheus.Counter
+	MismatchTotal        prometheus.Counter
+	ReleasedOnErrorTotal prometheus.Counter
+}
+
+func newMetrics(reg *prometheus.Registry) *Metrics {
+	m := &Metrics{
+		AcquiredTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idemguard_acquired_total",
+			Help: "Total number of newly acquired idempotency keys",
+		}),
+		ReplayedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idemguard_replayed_total",
+			Help: "Total number of replayed cached responses",
+		}),
+		ConflictTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idemguard_conflict_total",
+			Help: "Total number of 409 conflict responses",
+		}),
+		MismatchTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idemguard_mismatch_total",
+			Help: "Total number of 422 fingerprint mismatch errors",
+		}),
+		ReleasedOnErrorTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "idemguard_released_on_error_total",
+			Help: "Total number of locks released due to 5xx or panic",
+		}),
+	}
+	reg.MustRegister(
+		m.AcquiredTotal,
+		m.ReplayedTotal,
+		m.ConflictTotal,
+		m.MismatchTotal,
+		m.ReleasedOnErrorTotal,
+	)
+	return m
 }
 
 // Option configures Guard settings.
@@ -100,11 +134,13 @@ type Guard struct {
 	waitTimeout     time.Duration
 	ttl             time.Duration
 	maxCaptureBytes int
+	reg             *prometheus.Registry
 	metrics         *Metrics
 }
 
 // NewGuard creates a new Guard instance wrapping store.
 func NewGuard(store Store, opts ...Option) *Guard {
+	reg := prometheus.NewRegistry()
 	g := &Guard{
 		store:           store,
 		headerName:      DefaultHeaderName,
@@ -114,7 +150,8 @@ func NewGuard(store Store, opts ...Option) *Guard {
 		waitTimeout:     DefaultWaitTimeout,
 		ttl:             DefaultTTL,
 		maxCaptureBytes: DefaultMaxCaptureBytes,
-		metrics:         &Metrics{},
+		reg:             reg,
+		metrics:         newMetrics(reg),
 	}
 
 	for _, opt := range opts {
@@ -130,29 +167,8 @@ func (g *Guard) Metrics() *Metrics {
 }
 
 // MetricsHandler returns an HTTP handler serving Prometheus text format metrics.
-func (g *Guard) MetricsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		fmt.Fprintf(w, "# HELP idemguard_acquired_total Total number of newly acquired idempotency keys\n")
-		fmt.Fprintf(w, "# TYPE idemguard_acquired_total counter\n")
-		fmt.Fprintf(w, "idemguard_acquired_total %d\n", g.metrics.AcquiredTotal.Load())
-
-		fmt.Fprintf(w, "# HELP idemguard_replayed_total Total number of replayed cached responses\n")
-		fmt.Fprintf(w, "# TYPE idemguard_replayed_total counter\n")
-		fmt.Fprintf(w, "idemguard_replayed_total %d\n", g.metrics.ReplayedTotal.Load())
-
-		fmt.Fprintf(w, "# HELP idemguard_conflict_total Total number of 409 conflict responses\n")
-		fmt.Fprintf(w, "# TYPE idemguard_conflict_total counter\n")
-		fmt.Fprintf(w, "idemguard_conflict_total %d\n", g.metrics.ConflictTotal.Load())
-
-		fmt.Fprintf(w, "# HELP idemguard_mismatch_total Total number of 422 fingerprint mismatch errors\n")
-		fmt.Fprintf(w, "# TYPE idemguard_mismatch_total counter\n")
-		fmt.Fprintf(w, "idemguard_mismatch_total %d\n", g.metrics.MismatchTotal.Load())
-
-		fmt.Fprintf(w, "# HELP idemguard_released_on_error_total Total number of locks released due to 5xx or panic\n")
-		fmt.Fprintf(w, "# TYPE idemguard_released_on_error_total counter\n")
-		fmt.Fprintf(w, "idemguard_released_on_error_total %d\n", g.metrics.ReleasedOnErrorTotal.Load())
-	}
+func (g *Guard) MetricsHandler() http.Handler {
+	return promhttp.HandlerFor(g.reg, promhttp.HandlerOpts{})
 }
 
 // Wrap returns an http.Handler that wraps next with idempotency enforcement.
@@ -200,7 +216,7 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 		res, err := g.store.TryAcquire(req.Context(), scopedKey, fp, g.ttl)
 		if err != nil {
 			if err == ErrFingerprintMismatch || (res.Record != nil && res.Record.Fingerprint != fp) {
-				g.metrics.MismatchTotal.Add(1)
+				g.metrics.MismatchTotal.Inc()
 				w.Header().Set("X-Idempotent-Error", "fingerprint_mismatch")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnprocessableEntity)
@@ -215,13 +231,13 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 		if !res.Acquired {
 			if res.Record != nil && res.Record.Status == StatusCompleted {
 				g.replayResponse(w, res.Record)
-				g.metrics.ReplayedTotal.Add(1)
+				g.metrics.ReplayedTotal.Inc()
 				return
 			}
 
 			if res.Record != nil && res.Record.Status == StatusInFlight {
 				if g.waitPolicy == PolicyReject409 {
-					g.metrics.ConflictTotal.Add(1)
+					g.metrics.ConflictTotal.Inc()
 					w.Header().Set("Retry-After", "1")
 					w.Header().Set("X-Idempotent-Status", "in_flight")
 					http.Error(w, "conflict: in-flight request pending", http.StatusConflict)
@@ -231,7 +247,7 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 				// PolicyWaitAndReplay
 				waitCh := res.WaitCh
 				if waitCh == nil {
-					g.metrics.ConflictTotal.Add(1)
+					g.metrics.ConflictTotal.Inc()
 					w.Header().Set("Retry-After", "1")
 					http.Error(w, "conflict: in-flight request pending", http.StatusConflict)
 					return
@@ -243,17 +259,17 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 					rec, err := g.store.Get(req.Context(), scopedKey)
 					if err != nil {
 						// Leader failed (deleted on 5xx or panic)
-						g.metrics.ConflictTotal.Add(1)
+						g.metrics.ConflictTotal.Inc()
 						http.Error(w, "upstream leader failed, please retry", http.StatusServiceUnavailable)
 						return
 					}
 					g.replayResponse(w, rec)
-					g.metrics.ReplayedTotal.Add(1)
+					g.metrics.ReplayedTotal.Inc()
 					return
 				case <-req.Context().Done():
 					return
 				case <-time.After(g.waitTimeout):
-					g.metrics.ConflictTotal.Add(1)
+					g.metrics.ConflictTotal.Inc()
 					http.Error(w, "idempotency wait timeout", http.StatusGatewayTimeout)
 					return
 				}
@@ -264,7 +280,7 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 		defer func() {
 			if r := recover(); r != nil {
 				_ = g.store.Delete(context.Background(), scopedKey)
-				g.metrics.ReleasedOnErrorTotal.Add(1)
+				g.metrics.ReleasedOnErrorTotal.Inc()
 				panic(r)
 			}
 		}()
@@ -276,24 +292,17 @@ func (g *Guard) Wrap(next http.Handler) http.Handler {
 		if statusCode >= 500 {
 			// Never cache 5xx server errors; release lock so clients can retry
 			_ = g.store.Delete(context.Background(), scopedKey)
-			g.metrics.ReleasedOnErrorTotal.Add(1)
+			g.metrics.ReleasedOnErrorTotal.Inc()
 		} else {
 			// Cache 2xx, 3xx, 4xx responses
 			hdrs := rec.CapturedHeaders()
 			body := rec.CapturedBody()
 			_ = g.store.Complete(context.Background(), scopedKey, statusCode, hdrs, body, g.ttl)
-			g.metrics.AcquiredTotal.Add(1)
+			g.metrics.AcquiredTotal.Inc()
 		}
 	})
 }
 
 func (g *Guard) replayResponse(w http.ResponseWriter, rec *Record) {
-	for k, v := range rec.Headers {
-		w.Header().Set(k, v)
-	}
-	w.Header().Set("X-Idempotent-Replayed", "true")
-	w.WriteHeader(rec.StatusCode)
-	if len(rec.Body) > 0 {
-		_, _ = w.Write(rec.Body)
-	}
+	rec.ReplayTo(w)
 }

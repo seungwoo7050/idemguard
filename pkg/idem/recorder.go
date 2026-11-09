@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"net/http"
 	"strings"
+
+	"github.com/felixge/httpsnoop"
 )
 
 // DefaultMaxCaptureBytes limits response body buffering to 1MB.
 const DefaultMaxCaptureBytes = 1024 * 1024
 
-// ResponseRecorder wraps http.ResponseWriter to intercept and capture
-// status code, response headers, and response body up to MaxCaptureBytes.
-// It implements http.Flusher and Go 1.20+ Unwrap.
+// ResponseRecorder intercepts and captures response status code, headers, and body.
 type ResponseRecorder struct {
+	http.ResponseWriter
 	underlying      http.ResponseWriter
 	statusCode      int
 	writtenHeader   bool
@@ -26,46 +27,42 @@ func NewResponseRecorder(w http.ResponseWriter, maxCaptureBytes int) *ResponseRe
 	if maxCaptureBytes <= 0 {
 		maxCaptureBytes = DefaultMaxCaptureBytes
 	}
-	return &ResponseRecorder{
+	rec := &ResponseRecorder{
 		underlying:      w,
 		statusCode:      http.StatusOK,
 		maxCaptureBytes: maxCaptureBytes,
 	}
-}
-
-// Header returns the header map from the underlying ResponseWriter.
-func (r *ResponseRecorder) Header() http.Header {
-	return r.underlying.Header()
-}
-
-// WriteHeader records the status code and forwards it to the underlying ResponseWriter.
-func (r *ResponseRecorder) WriteHeader(code int) {
-	if !r.writtenHeader {
-		r.statusCode = code
-		r.writtenHeader = true
-		r.underlying.WriteHeader(code)
-	}
-}
-
-// Write captures data in memory (up to maxCaptureBytes) and forwards bytes to underlying writer.
-func (r *ResponseRecorder) Write(p []byte) (int, error) {
-	if !r.writtenHeader {
-		r.WriteHeader(http.StatusOK)
-	}
-
-	if !r.overflow {
-		remaining := r.maxCaptureBytes - r.body.Len()
-		if remaining >= len(p) {
-			r.body.Write(p)
-		} else {
-			if remaining > 0 {
-				r.body.Write(p[:remaining])
+	rec.ResponseWriter = httpsnoop.Wrap(w, httpsnoop.Hooks{
+		WriteHeader: func(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
+			return func(code int) {
+				if !rec.writtenHeader {
+					rec.statusCode = code
+					rec.writtenHeader = true
+				}
+				next(code)
 			}
-			r.overflow = true
-		}
-	}
-
-	return r.underlying.Write(p)
+		},
+		Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+			return func(p []byte) (int, error) {
+				if !rec.writtenHeader {
+					rec.writtenHeader = true
+				}
+				if !rec.overflow {
+					remaining := rec.maxCaptureBytes - rec.body.Len()
+					if remaining >= len(p) {
+						rec.body.Write(p)
+					} else {
+						if remaining > 0 {
+							rec.body.Write(p[:remaining])
+						}
+						rec.overflow = true
+					}
+				}
+				return next(p)
+			}
+		},
+	})
+	return rec
 }
 
 // Flush forwards flush requests to the underlying writer if it implements http.Flusher.
@@ -98,7 +95,7 @@ func (r *ResponseRecorder) IsOverflow() bool {
 // CapturedHeaders extracts single-value headers suitable for idempotency persistence,
 // filtering out hop-by-hop transport headers.
 func (r *ResponseRecorder) CapturedHeaders() map[string]string {
-	h := r.underlying.Header()
+	h := r.Header()
 	out := make(map[string]string, len(h))
 	for k, vals := range h {
 		lower := strings.ToLower(k)
@@ -110,4 +107,17 @@ func (r *ResponseRecorder) CapturedHeaders() map[string]string {
 		}
 	}
 	return out
+}
+
+// ReplayTo writes the captured response to another http.ResponseWriter.
+func (r *ResponseRecorder) ReplayTo(w http.ResponseWriter) {
+	for k, v := range r.CapturedHeaders() {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("X-Idempotent-Replayed", "true")
+	w.WriteHeader(r.statusCode)
+	body := r.CapturedBody()
+	if len(body) > 0 {
+		_, _ = w.Write(body)
+	}
 }

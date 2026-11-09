@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/woopinbell/idemguard/pkg/idem"
+	"github.com/seungwoo7050/idemguard/pkg/idem"
 )
 
 func main() {
@@ -65,8 +65,8 @@ func main() {
 		WriteTimeout: 60 * time.Second,
 	}
 
-	stopCh := make(chan os.Signal, 1)
-	signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
 		log.Printf("idemguard listening on %s -> upstream %s (policy=%s, ttl=%v)", *listenAddr, *upstreamStr, policy, *ttl)
@@ -75,7 +75,7 @@ func main() {
 		}
 	}()
 
-	<-stopCh
+	<-ctx.Done()
 	log.Println("shutting down idemguard server gracefully...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

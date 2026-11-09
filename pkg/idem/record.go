@@ -1,7 +1,10 @@
 package idem
 
 import (
+	"bytes"
 	"errors"
+	"maps"
+	"net/http"
 	"time"
 )
 
@@ -64,17 +67,21 @@ func (r *Record) Clone() *Record {
 		return nil
 	}
 	cp := *r
-	if r.Headers != nil {
-		cp.Headers = make(map[string]string, len(r.Headers))
-		for k, v := range r.Headers {
-			cp.Headers[k] = v
-		}
-	}
-	if len(r.Body) > 0 {
-		cp.Body = make([]byte, len(r.Body))
-		copy(cp.Body, r.Body)
-	}
+	cp.Headers = maps.Clone(r.Headers)
+	cp.Body = bytes.Clone(r.Body)
 	return &cp
+}
+
+// ReplayTo writes the cached response headers, status code, and body to w.
+func (r *Record) ReplayTo(w http.ResponseWriter) {
+	for k, v := range r.Headers {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("X-Idempotent-Replayed", "true")
+	w.WriteHeader(r.StatusCode)
+	if len(r.Body) > 0 {
+		_, _ = w.Write(r.Body)
+	}
 }
 
 // AcquireResult contains the outcome of an idempotency key acquisition attempt.
